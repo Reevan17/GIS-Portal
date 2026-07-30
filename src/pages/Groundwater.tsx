@@ -15,6 +15,7 @@ import type { GroundwaterStateCollection } from '../types';
 import type { GeoJsonObject } from 'geojson';
 import { motion } from 'framer-motion';
 import { FiAlertTriangle, FiCheckCircle, FiPercent, FiInfo, FiDatabase, FiLayers } from 'react-icons/fi';
+import GroundwaterPrediction from '../components/dashboard/GroundwaterPrediction';
 
 // ─── Data helpers ──────────────────────────────────────────────────────────────
 
@@ -312,6 +313,11 @@ export const Groundwater: React.FC = () => {
               <Legend title="GW Extraction Stage" items={GROUNDWATER_LEGEND} />
             </div>
           </div>
+        </div>
+        
+        {/* Prediction Section */}
+        <div className="mt-8">
+          <GroundwaterPrediction />
         </div>
       </div>
     </MapProvider>

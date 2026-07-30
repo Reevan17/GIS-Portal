@@ -1,4 +1,5 @@
 import type { FeatureCollection } from 'geojson';
+import { normalizeFeatures } from '../utils/normalizeFeatures';
 import type {
   AvailableYear,
   RainfallProperties,
@@ -23,6 +24,10 @@ async function fetchJson<T>(url: string): Promise<T> {
     throw new Error(`Failed to load data from ${url}: ${res.statusText}`);
   }
   const data = await res.json();
+  
+  // Normalize raw QGIS property names into canonical names
+  normalizeFeatures(data, url);
+  
   fetchCache.set(url, data);
   return data as T;
 }
