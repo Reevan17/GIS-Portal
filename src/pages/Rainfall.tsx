@@ -15,7 +15,6 @@ import { FiTrendingUp, FiClock, FiLayers, FiInfo, FiCloud, FiDroplet } from 'rea
 import { motion } from 'framer-motion';
 import type { RainfallCollection } from '../types';
 import type { GeoJsonObject } from 'geojson';
-import RainfallPrediction from '../components/dashboard/RainfallPrediction';
 
 // ── Rainfall category ranking metadata ────────────────────────────────────────
 const CATEGORY_COLORS: Record<string, string> = {
@@ -304,11 +303,6 @@ export const Rainfall: React.FC = () => {
               <Legend title="Rainfall Legend" items={RAINFALL_LEGEND} />
             </div>
           </div>
-        </div>
-        
-        {/* Prediction Section */}
-        <div className="mt-8">
-          <RainfallPrediction />
         </div>
       </div>
     </MapProvider>

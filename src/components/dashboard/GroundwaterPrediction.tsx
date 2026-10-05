@@ -5,6 +5,7 @@ import {
   LinearScale,
   PointElement,
   LineElement,
+  BarElement,
   Title,
   Tooltip,
   Legend as ChartLegend,
@@ -20,21 +21,27 @@ import {
   FiMinus,
   FiAlertTriangle,
   FiCheckCircle,
-  FiTarget,
   FiDatabase,
   FiPercent,
+  FiCloudRain,
+  FiActivity,
+  FiSliders,
 } from 'react-icons/fi';
 import { AVAILABLE_YEARS } from '../../types';
 import type { AvailableYear } from '../../types';
 import { dataLoader } from '../../services/dataLoader';
-import { fitPolynomialRegression as linearRegression, predict } from '../../utils/linearRegression';
-import type { DataPoint, RegressionModel } from '../../utils/linearRegression';
+import {
+  fitMultivariateGroundwaterModel,
+  type HydrogeologicalPoint,
+  type MultivariateGWModel,
+} from '../../utils/multivariateRegression';
 
 ChartJS.register(
   CategoryScale,
   LinearScale,
   PointElement,
   LineElement,
+  BarElement,
   Title,
   Tooltip,
   ChartLegend,
@@ -43,16 +50,21 @@ ChartJS.register(
 
 const PREDICTION_YEAR = 2026;
 
-// ── Per-state groundwater prediction result ───────────────────────────────────
+// ── Rainfall Scenario Types ───────────────────────────────────────────────────
+export type RainfallScenario = 'normal' | 'deficit' | 'surplus';
+
 interface GWStatePrediction {
   state: string;
-  predictedStage: number;
-  historicalData: DataPoint[];
-  model: RegressionModel;
-  trend: 'increasing' | 'decreasing' | 'stable';
+  history: HydrogeologicalPoint[];
+  model: MultivariateGWModel;
   latestStage: number;
+  latestRainfall: number;
+  avgRainfall: number;
+  predictedStage: number;
+  scenarioRainfall: number;
   predictedCategory: string;
   categoryColor: string;
+  trend: 'increasing' | 'decreasing' | 'stable';
 }
 
 function getGWCategory(stage: number): { label: string; color: string } {
@@ -62,58 +74,127 @@ function getGWCategory(stage: number): { label: string; color: string } {
   return { label: 'Safe', color: '#10B981' };
 }
 
-// ── Build per-state predictions from multi-year groundwater data ──────────────
-function buildGWPredictions(
-  allData: Record<number, any>
-): GWStatePrediction[] {
-  const stateMap = new Map<string, DataPoint[]>();
+function cleanStateKey(s: string): string {
+  return s.toUpperCase().replace(/&/g, 'AND').replace(/[^A-Z]/g, '');
+}
 
-  for (const yearKey of Object.keys(allData)) {
+// ── Build Coupled Groundwater + Rainfall Model ────────────────────────────────
+function buildHydrogeologicalPredictions(
+  gwData: Record<number, any>,
+  rainData: Record<number, any>,
+  scenario: RainfallScenario,
+  scenarioMultiplier: number
+): GWStatePrediction[] {
+  // Collect state -> year -> { stage, rain }
+  const stateYearMap = new Map<string, { year: number; stage?: number; rain?: number }[]>();
+  const canonicalNames = new Map<string, string>();
+
+  // 1. Process Groundwater Data
+  for (const yearKey of Object.keys(gwData)) {
     const year = Number(yearKey);
-    const fc = allData[year as AvailableYear];
+    const fc = gwData[year as AvailableYear];
     if (!fc?.features) continue;
 
     for (const feature of fc.features) {
-      const state: string | undefined = feature.properties?.State;
+      const stateName: string | undefined = feature.properties?.State || feature.properties?.STATE;
       const stage: number | undefined = feature.properties?.Stage_of_G;
-      if (!state || stage === undefined || isNaN(stage)) continue;
+      if (!stateName || stage === undefined || isNaN(stage)) continue;
 
-      if (!stateMap.has(state)) stateMap.set(state, []);
-      stateMap.get(state)!.push({ x: year, y: stage });
+      const key = cleanStateKey(stateName);
+      if (!canonicalNames.has(key)) canonicalNames.set(key, stateName);
+
+      if (!stateYearMap.has(key)) stateYearMap.set(key, []);
+      const existing = stateYearMap.get(key)!.find((p) => p.year === year);
+      if (existing) {
+        existing.stage = stage;
+      } else {
+        stateYearMap.get(key)!.push({ year, stage });
+      }
     }
   }
 
-  const predictions: GWStatePrediction[] = [];
+  // 2. Process Corresponding Rainfall Data
+  for (const yearKey of Object.keys(rainData)) {
+    const year = Number(yearKey);
+    const fc = rainData[year as AvailableYear];
+    if (!fc?.features) continue;
 
-  for (const [state, points] of stateMap.entries()) {
-    points.sort((a, b) => a.x - b.x);
+    for (const feature of fc.features) {
+      const stateName: string | undefined = feature.properties?.State || feature.properties?.STATE;
+      const rainfall: number | undefined = feature.properties?.rainfall;
+      if (!stateName || rainfall === undefined || isNaN(rainfall)) continue;
 
-    const model = linearRegression(points);
+      const key = cleanStateKey(stateName);
+      if (!stateYearMap.has(key)) continue;
+
+      const existing = stateYearMap.get(key)!.find((p) => p.year === year);
+      if (existing) {
+        existing.rain = rainfall;
+      } else {
+        stateYearMap.get(key)!.push({ year, rain: rainfall });
+      }
+    }
+  }
+
+  const results: GWStatePrediction[] = [];
+
+  for (const [key, rawPoints] of stateYearMap.entries()) {
+    const stateName = canonicalNames.get(key) || key;
+
+    // Filter points having both valid stage and rainfall
+    const validPoints: HydrogeologicalPoint[] = rawPoints
+      .filter((p): p is { year: number; stage: number; rain: number } => 
+        p.stage !== undefined && !isNaN(p.stage) && p.rain !== undefined && !isNaN(p.rain)
+      )
+      .map((p) => ({
+        year: p.year,
+        groundwaterStage: p.stage,
+        rainfall: p.rain,
+      }))
+      .sort((a, b) => a.year - b.year);
+
+    if (validPoints.length < 4) continue;
+
+    const model = fitMultivariateGroundwaterModel(validPoints);
     if (!model) continue;
 
-    const predicted = Math.max(0, predict(model, PREDICTION_YEAR));
-    const latest = points[points.length - 1].y;
+    const latest = validPoints[validPoints.length - 1];
+    const prevStage = latest.groundwaterStage;
+
+    // Determine 2026 scenario rainfall
+    let scenarioRain = model.avgRainfall;
+    if (scenario === 'deficit') {
+      scenarioRain = model.avgRainfall * (1 - scenarioMultiplier);
+    } else if (scenario === 'surplus') {
+      scenarioRain = model.avgRainfall * (1 + scenarioMultiplier);
+    }
+
+    const predicted = Math.max(0, model.predict(prevStage, scenarioRain, PREDICTION_YEAR));
     const { label, color } = getGWCategory(predicted);
 
     let trend: GWStatePrediction['trend'] = 'stable';
-    if (model.slope > 0.5) trend = 'increasing';
-    else if (model.slope < -0.5) trend = 'decreasing';
+    const delta = predicted - prevStage;
+    if (delta > 1.0) trend = 'increasing';
+    else if (delta < -1.0) trend = 'decreasing';
 
-    predictions.push({
-      state,
-      predictedStage: predicted,
-      historicalData: points,
+    results.push({
+      state: stateName,
+      history: validPoints,
       model,
-      trend,
-      latestStage: latest,
+      latestStage: prevStage,
+      latestRainfall: latest.rainfall,
+      avgRainfall: model.avgRainfall,
+      predictedStage: predicted,
+      scenarioRainfall: scenarioRain,
       predictedCategory: label,
       categoryColor: color,
+      trend,
     });
   }
 
-  // Sort by predicted extraction stage descending (most exploited first)
-  predictions.sort((a, b) => b.predictedStage - a.predictedStage);
-  return predictions;
+  // Sort by predicted stage descending (most stressed first)
+  results.sort((a, b) => b.predictedStage - a.predictedStage);
+  return results;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -123,24 +204,43 @@ const GroundwaterPrediction: React.FC = () => {
   const [selectedState, setSelectedState] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
 
-  // Load all years of groundwater state data
+  // Scenario Simulator: 'normal' | 'deficit' | 'surplus'
+  const [scenario, setScenario] = useState<RainfallScenario>('normal');
+  const [scenarioDelta] = useState<number>(0.20); // 20% deficit/surplus
+
+  // Raw fetched data caches
+  const [rawGwData, setRawGwData] = useState<Record<number, any> | null>(null);
+  const [rawRainData, setRawRainData] = useState<Record<number, any> | null>(null);
+
+  // Load both Groundwater and Rainfall datasets
   useEffect(() => {
     setIsLoading(true);
     setError(null);
 
-    dataLoader
-      .getAllGroundwaterStateData([...AVAILABLE_YEARS])
-      .then((allData) => {
-        const preds = buildGWPredictions(allData);
+    Promise.all([
+      dataLoader.getAllGroundwaterStateData([...AVAILABLE_YEARS]),
+      dataLoader.getAllRainfallData([...AVAILABLE_YEARS]),
+    ])
+      .then(([gwData, rainData]) => {
+        setRawGwData(gwData);
+        setRawRainData(rainData);
+        const preds = buildHydrogeologicalPredictions(gwData, rainData, 'normal', 0.20);
         setPredictions(preds);
         if (preds.length > 0) setSelectedState(preds[0].state);
       })
       .catch((err) => {
-        console.error('Failed to load groundwater data for prediction:', err);
-        setError('Could not load historical groundwater data.');
+        console.error('Failed to load groundwater/rainfall data for prediction:', err);
+        setError('Could not load historical groundwater and rainfall datasets.');
       })
       .finally(() => setIsLoading(false));
   }, []);
+
+  // Re-run scenario calculations when scenario changes
+  useEffect(() => {
+    if (!rawGwData || !rawRainData) return;
+    const preds = buildHydrogeologicalPredictions(rawGwData, rawRainData, scenario, scenarioDelta);
+    setPredictions(preds);
+  }, [scenario, scenarioDelta, rawGwData, rawRainData]);
 
   // Derived stats
   const summaryStats = useMemo(() => {
@@ -148,16 +248,13 @@ const GroundwaterPrediction: React.FC = () => {
 
     const avgStage =
       predictions.reduce((s, p) => s + p.predictedStage, 0) / predictions.length;
-
     const overExploited = predictions.filter((p) => p.predictedStage > 100).length;
     const critical = predictions.filter(
       (p) => p.predictedStage > 90 && p.predictedStage <= 100
     ).length;
     const safe = predictions.filter((p) => p.predictedStage <= 70).length;
-
     const avgR2 =
       predictions.reduce((s, p) => s + p.model.rSquared, 0) / predictions.length;
-
     const mostStressed = predictions[0];
 
     return { avgStage, overExploited, critical, safe, avgR2, mostStressed };
@@ -168,83 +265,90 @@ const GroundwaterPrediction: React.FC = () => {
     [predictions, selectedState]
   );
 
-  // ── Chart data for the selected state ────────────────────────────────────
+  // ── Dual-Metric Chart (Groundwater Stage % + Rainfall mm) ───────────────────
   const chartData = useMemo(() => {
     if (!activePrediction) return null;
 
-    const { historicalData, predictedStage } = activePrediction;
-    const historicalLabels = historicalData.map((d) => String(d.x));
-    const historicalValues = historicalData.map((d) => d.y);
+    const { history, predictedStage, scenarioRainfall } = activePrediction;
+    const labels = [...history.map((d) => String(d.year)), String(PREDICTION_YEAR)];
 
-    const allLabels = [...historicalLabels, String(PREDICTION_YEAR)];
-    const historicalLine = [...historicalValues, null];
+    // Historical Stage line (null for 2026)
+    const stageHistory = [...history.map((d) => d.groundwaterStage), null];
 
-    const model = activePrediction.model;
-    const trendLine = allLabels.map((label) => predict(model, Number(label)));
+    // Predicted point (null for past years)
+    const predictedPoint = [...Array(history.length).fill(null), predictedStage];
 
-    // Danger threshold line at 100%
-    const thresholdLine = allLabels.map(() => 100);
+    // Over-Exploited 100% reference line
+    const thresholdLine = labels.map(() => 100);
+
+    // Corresponding rainfall bars (mm)
+    const rainfallData = [...history.map((d) => d.rainfall), scenarioRainfall];
 
     return {
-      labels: allLabels,
+      labels,
       datasets: [
         {
-          label: 'Extraction Stage (%)',
-          data: historicalLine,
+          type: 'line' as const,
+          label: 'Groundwater Stage (%)',
+          data: stageHistory,
           borderColor: '#38BDF8',
           backgroundColor: 'rgba(56, 189, 248, 0.08)',
           pointBackgroundColor: '#38BDF8',
-          pointBorderColor: '#38BDF8',
+          pointBorderColor: '#ffffff',
           pointRadius: 5,
           pointHoverRadius: 7,
           fill: true,
-          tension: 0.3,
+          tension: 0.25,
           borderWidth: 2.5,
-          spanGaps: false,
+          yAxisID: 'yStage',
         },
         {
-          label: 'Regression Trend',
-          data: trendLine,
-          borderColor: '#F59E0B',
-          borderDash: [8, 4],
-          pointRadius: 0,
-          pointHoverRadius: 0,
-          fill: false,
-          tension: 0,
-          borderWidth: 2,
-        },
-        {
-          label: `Predicted ${PREDICTION_YEAR}`,
-          data: [...Array(historicalValues.length).fill(null), predictedStage],
+          type: 'line' as const,
+          label: `Predicted ${PREDICTION_YEAR} (${scenario.toUpperCase()})`,
+          data: predictedPoint,
           borderColor: activePrediction.categoryColor,
           backgroundColor: activePrediction.categoryColor,
           pointBackgroundColor: activePrediction.categoryColor,
           pointBorderColor: '#ffffff',
           pointBorderWidth: 2,
-          pointRadius: 8,
-          pointHoverRadius: 10,
+          pointRadius: 9,
+          pointHoverRadius: 11,
           pointStyle: 'star' as const,
-          fill: false,
           showLine: false,
+          yAxisID: 'yStage',
         },
         {
-          label: 'Over-Exploitation Threshold',
+          type: 'line' as const,
+          label: 'Over-Exploitation (100%)',
           data: thresholdLine,
-          borderColor: 'rgba(239, 68, 68, 0.3)',
-          borderDash: [4, 4],
+          borderColor: 'rgba(239, 68, 68, 0.4)',
+          borderDash: [5, 5],
           pointRadius: 0,
-          pointHoverRadius: 0,
-          fill: false,
-          tension: 0,
           borderWidth: 1.5,
+          fill: false,
+          yAxisID: 'yStage',
+        },
+        {
+          type: 'bar' as const,
+          label: 'Annual Rainfall (mm)',
+          data: rainfallData,
+          backgroundColor: 'rgba(99, 102, 241, 0.15)',
+          borderColor: 'rgba(99, 102, 241, 0.4)',
+          borderWidth: 1,
+          borderRadius: 6,
+          yAxisID: 'yRain',
         },
       ],
     };
-  }, [activePrediction]);
+  }, [activePrediction, scenario]);
 
-  const chartOptions = {
+  const chartOptions: any = {
     responsive: true,
     maintainAspectRatio: false,
+    interaction: {
+      mode: 'index',
+      intersect: false,
+    },
     plugins: {
       legend: {
         labels: {
@@ -266,6 +370,9 @@ const GroundwaterPrediction: React.FC = () => {
           label: (ctx: any) => {
             const val = ctx.parsed?.y;
             if (val == null) return '';
+            if (ctx.dataset.yAxisID === 'yRain') {
+              return ` ${ctx.dataset.label}: ${val.toFixed(0)} mm`;
+            }
             return ` ${ctx.dataset.label}: ${val.toFixed(1)}%`;
           },
         },
@@ -279,12 +386,37 @@ const GroundwaterPrediction: React.FC = () => {
           font: { family: 'Inter', weight: 'bold' as const },
         },
       },
-      y: {
+      yStage: {
+        type: 'linear' as const,
+        position: 'left' as const,
+        title: {
+          display: true,
+          text: 'GW Extraction Stage (%)',
+          color: 'rgba(56, 189, 248, 0.8)',
+          font: { family: 'Inter', size: 11, weight: 'bold' as const },
+        },
         grid: { color: 'rgba(255,255,255,0.03)' },
         ticks: {
           color: 'rgba(255,255,255,0.5)',
           font: { family: 'Inter' },
           callback: (val: any) => `${val}%`,
+        },
+        suggestedMin: 0,
+      },
+      yRain: {
+        type: 'linear' as const,
+        position: 'right' as const,
+        title: {
+          display: true,
+          text: 'Rainfall (mm)',
+          color: 'rgba(99, 102, 241, 0.8)',
+          font: { family: 'Inter', size: 11, weight: 'bold' as const },
+        },
+        grid: { drawOnChartArea: false },
+        ticks: {
+          color: 'rgba(99, 102, 241, 0.6)',
+          font: { family: 'Inter' },
+          callback: (val: any) => `${val} mm`,
         },
         suggestedMin: 0,
       },
@@ -294,13 +426,12 @@ const GroundwaterPrediction: React.FC = () => {
   // ── Trend icon helper ────────────────────────────────────────────────────
   const TrendIcon: React.FC<{ trend: GWStatePrediction['trend'] }> = ({ trend }) => {
     if (trend === 'increasing')
-      return <FiTrendingUp className="text-red-400" size={14} title="Increasing extraction" />;
+      return <FiTrendingUp className="text-red-400" size={14} title="Extraction stage increasing" />;
     if (trend === 'decreasing')
-      return <FiTrendingDown className="text-green-400" size={14} title="Decreasing extraction" />;
+      return <FiTrendingDown className="text-green-400" size={14} title="Extraction stage decreasing" />;
     return <FiMinus className="text-yellow-400" size={14} title="Stable" />;
   };
 
-  // ── Loading state ────────────────────────────────────────────────────────
   if (isLoading) {
     return (
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 border-t border-white/5">
@@ -313,7 +444,7 @@ const GroundwaterPrediction: React.FC = () => {
               <FiCpu className="text-primary text-2xl" />
             </motion.div>
             <span className="text-sm text-white/60 font-medium">
-              Running polynomial regression on historical groundwater data…
+              Calibrating multivariate hydrogeological regression (Groundwater Stage ~ Rainfall + Historical Lag)…
             </span>
           </div>
         </GlassCard>
@@ -328,7 +459,7 @@ const GroundwaterPrediction: React.FC = () => {
           <div className="text-center py-12 text-white/50">
             <FiDatabase size={32} className="mx-auto mb-2 opacity-40" />
             <p className="text-sm font-medium">
-              {error ?? 'No groundwater data available for prediction.'}
+              {error ?? 'No coupled groundwater and rainfall data available.'}
             </p>
           </div>
         </GlassCard>
@@ -345,18 +476,44 @@ const GroundwaterPrediction: React.FC = () => {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5 }}
         >
-          <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-xs text-blue-400 font-bold tracking-wider uppercase mb-4">
-            <FiCpu size={12} />
-            AI / ML Prediction Engine
+          <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-xs text-cyan-400 font-bold tracking-wider uppercase mb-4">
+            <FiActivity size={12} />
+            Hydrogeological Coupled Model
           </div>
           <h2 className="text-2xl font-bold tracking-wide text-white">
-            Groundwater Extraction Forecast — {PREDICTION_YEAR}
+            Groundwater Prediction Coupled with Rainfall — {PREDICTION_YEAR}
           </h2>
-          <p className="text-sm text-white/50 mt-2 max-w-2xl mx-auto">
-            Polynomial regression model trained on {AVAILABLE_YEARS.length} years of state-level CGWB
-            groundwater extraction data to predict next-year aquifer stress levels
+          <p className="text-sm text-white/50 mt-2 max-w-2xl mx-auto leading-relaxed">
+            Autoregressive Distributed Lag (ARDL) model predicting aquifer extraction stage using historical groundwater consumption and corresponding annual rainfall recharge.
           </p>
         </motion.div>
+
+        {/* Rainfall Scenario Selector Controls */}
+        <div className="mt-6 flex flex-wrap items-center justify-center gap-2.5">
+          <span className="text-xs text-white/40 uppercase tracking-wider font-bold mr-1 flex items-center gap-1.5">
+            <FiSliders size={13} />
+            2026 Monsoon Scenario:
+          </span>
+          {[
+            { id: 'normal' as const, label: 'Normal Rainfall (100%)', icon: FiCloudRain, color: '#38BDF8' },
+            { id: 'deficit' as const, label: 'Deficit / Drought (-20%)', icon: FiTrendingUp, color: '#EF4444' },
+            { id: 'surplus' as const, label: 'Surplus Monsoon (+20%)', icon: FiTrendingDown, color: '#10B981' },
+          ].map(({ id, label, icon: Icon, color }) => (
+            <button
+              key={id}
+              onClick={() => setScenario(id)}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                scenario === id
+                  ? 'bg-white/10 text-white shadow-lg border border-white/20'
+                  : 'bg-white/[0.03] text-white/50 border border-white/5 hover:bg-white/[0.06] hover:text-white/80'
+              }`}
+              style={scenario === id ? { borderColor: `${color}80` } : {}}
+            >
+              <Icon size={13} style={{ color }} />
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* KPI Cards */}
@@ -369,29 +526,30 @@ const GroundwaterPrediction: React.FC = () => {
         >
           {[
             {
-              label: 'Predicted Avg Extraction',
+              label: 'Avg Predicted Extraction',
               value: `${summaryStats.avgStage.toFixed(1)}%`,
+              sub: `Under ${scenario} rainfall`,
               icon: FiPercent,
               color: '#38BDF8',
             },
             {
-              label: 'Over-Exploited Zones',
+              label: 'Over-Exploited States',
               value: String(summaryStats.overExploited),
-              sub: `+ ${summaryStats.critical} critical`,
+              sub: `+ ${summaryStats.critical} critical states`,
               icon: FiAlertTriangle,
               color: '#EF4444',
             },
             {
-              label: 'Safe Zones',
+              label: 'Safe States',
               value: String(summaryStats.safe),
-              sub: `of ${predictions.length} states`,
+              sub: `of ${predictions.length} states/UTs`,
               icon: FiCheckCircle,
               color: '#10B981',
             },
             {
-              label: 'Avg Model R² Score',
+              label: 'Coupled Model Avg R²',
               value: summaryStats.avgR2.toFixed(3),
-              sub: summaryStats.avgR2 > 0.5 ? 'Good fit' : 'Moderate fit',
+              sub: 'Hydrogeological ARDL fit',
               icon: FiCpu,
               color: '#F59E0B',
             },
@@ -435,7 +593,7 @@ const GroundwaterPrediction: React.FC = () => {
               <div className="flex items-center gap-2">
                 <FiDatabase className="text-blue-400 text-lg" />
                 <h3 className="text-sm font-bold uppercase tracking-wider text-white/80">
-                  Extraction Stage Trend & Prediction
+                  Aquifer Extraction & Rainfall History ({selectedState})
                 </h3>
               </div>
 
@@ -454,32 +612,37 @@ const GroundwaterPrediction: React.FC = () => {
               </select>
             </div>
 
-            {/* Chart */}
+            {/* Chart Container */}
             <div className="h-80 relative">
-              {chartData && <Line data={chartData} options={chartOptions} />}
+              {chartData && <Line data={chartData as any} options={chartOptions} />}
             </div>
 
-            {/* Selected state details */}
+            {/* Model Mathematical Parameters */}
             {activePrediction && (
               <div className="mt-4 pt-4 border-t border-white/5 grid grid-cols-2 sm:grid-cols-4 gap-3">
                 {[
                   {
-                    label: 'Slope',
-                    value: `${activePrediction.model.slope > 0 ? '+' : ''}${activePrediction.model.slope.toFixed(3)} %/yr`,
+                    label: 'Model R² Score',
+                    value: activePrediction.model.rSquared.toFixed(3),
+                    highlight: '#10B981',
                   },
                   {
-                    label: 'R² Score',
-                    value: activePrediction.model.rSquared.toFixed(4),
+                    label: 'Rainfall Sensitivity (β₂)',
+                    value: `${activePrediction.model.betaRainfall.toFixed(2)} %/m`,
+                    sub: activePrediction.model.betaRainfall < 0 ? 'Recharge cushions extraction' : 'High pump correlation',
                   },
                   {
-                    label: `Predicted ${PREDICTION_YEAR}`,
+                    label: 'Rainfall vs GW Correlation',
+                    value: `r = ${activePrediction.model.pearsonCorrRainGW.toFixed(2)}`,
+                    sub: activePrediction.model.pearsonCorrRainGW < 0 ? 'Inverse (Recharge effect)' : 'Direct variation',
+                  },
+                  {
+                    label: `2026 Predicted Stage`,
                     value: `${activePrediction.predictedStage.toFixed(1)}%`,
+                    highlight: activePrediction.categoryColor,
+                    sub: activePrediction.predictedCategory,
                   },
-                  {
-                    label: 'Predicted Category',
-                    value: activePrediction.predictedCategory,
-                  },
-                ].map(({ label, value }) => (
+                ].map(({ label, value, highlight, sub }) => (
                   <div
                     key={label}
                     className="bg-white/[0.03] border border-white/5 rounded-lg p-2.5 text-center"
@@ -487,7 +650,13 @@ const GroundwaterPrediction: React.FC = () => {
                     <p className="text-[10px] text-white/40 uppercase tracking-wider font-bold mb-0.5">
                       {label}
                     </p>
-                    <p className="text-xs font-bold font-mono text-white">{value}</p>
+                    <p
+                      className="text-xs font-bold font-mono text-white"
+                      style={highlight ? { color: highlight } : {}}
+                    >
+                      {value}
+                    </p>
+                    {sub && <p className="text-[9px] text-white/30 mt-0.5 truncate">{sub}</p>}
                   </div>
                 ))}
               </div>
@@ -503,9 +672,14 @@ const GroundwaterPrediction: React.FC = () => {
           className="lg:col-span-4"
         >
           <GlassCard className="h-full">
-            <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400 border-b border-white/10 pb-3 mb-4">
-              {PREDICTION_YEAR} Stress Rankings
-            </h3>
+            <div className="flex items-center justify-between border-b border-white/10 pb-3 mb-4">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-400">
+                {PREDICTION_YEAR} State Stress Rankings
+              </h3>
+              <span className="text-[10px] text-white/40 font-mono">
+                {scenario.toUpperCase()}
+              </span>
+            </div>
 
             <div className="flex flex-col gap-1.5 max-h-[440px] overflow-y-auto custom-scrollbar pr-1">
               {predictions.map((p, idx) => (
@@ -562,10 +736,11 @@ const GroundwaterPrediction: React.FC = () => {
             {/* Model info footer */}
             <div className="mt-4 pt-3 border-t border-white/5">
               <p className="text-[10px] text-white/30 leading-relaxed">
-                <strong className="text-white/50">Model:</strong> Polynomial regression (Degree 2) on Stage
-                of GW Extraction (%).{' '}
-                <span className="font-mono text-blue-400/70">ŷ = ax² + bx + c</span> where x = year.
-                Red dashed line at 100% marks over-exploitation threshold.
+                <strong className="text-white/50">ARDL Formula:</strong>{' '}
+                <span className="font-mono text-cyan-400/80">
+                  Stage_t = β₀ + β₁(Stage_{'{t-1}'}) + β₂(Rainfall_t) + β₃(Year)
+                </span>
+                . Quantifies natural aquifer recharge alongside anthropogenic draft.
               </p>
             </div>
           </GlassCard>
